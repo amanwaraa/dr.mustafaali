@@ -215,7 +215,7 @@
     }
 
     .icon-btn.syncing i{
-      animation:syncSpin .8s linear infinite;
+      animation:syncSpin 1.6s linear infinite;
       color:#1d4ed8;
     }
 
@@ -3069,7 +3069,7 @@
     window.OSKAR_TRIAL_FIREBASE_ALLOWED = !OSKAR_TRIAL_ACTIVE;
     const FALLBACK_ROOTS = OSKAR_TRIAL_ACTIVE ? [] : (Array.isArray(externalFirebase.fallbackRoots) ? externalFirebase.fallbackRoots : []);
     const DB_NAME = `cashier_units_pro_${DB_NAMESPACE}_db_v16`;
-    const DB_VERSION = 15;
+    const DB_VERSION = 120;
 
     const STORE_NAMES = [
       "products",
@@ -3940,22 +3940,60 @@
       });
     }
 
+    function ensureDbStores(database) {
+      STORE_NAMES.forEach((name) => {
+        if (!database.objectStoreNames.contains(name)) {
+          database.createObjectStore(name, { keyPath: "id" });
+        }
+      });
+    }
+
+    function openIndexedDbWithVersion(version, resolve, reject, retryDepth = 0) {
+      const safeVersion = Math.max(Number(version || DB_VERSION) || DB_VERSION, DB_VERSION);
+      const req = indexedDB.open(DB_NAME, safeVersion);
+
+      req.onupgradeneeded = () => {
+        ensureDbStores(req.result);
+      };
+
+      req.onsuccess = () => {
+        const database = req.result;
+        const missingStores = STORE_NAMES.some((name) => !database.objectStoreNames.contains(name));
+
+        if (missingStores && retryDepth < 3) {
+          const nextVersion = Math.max(Number(database.version || safeVersion) + 1, safeVersion + 1);
+          database.close();
+          openIndexedDbWithVersion(nextVersion, resolve, reject, retryDepth + 1);
+          return;
+        }
+
+        resolve(database);
+      };
+
+      req.onerror = () => {
+        const err = req.error;
+        const isVersionError = err && (err.name === "VersionError" || String(err.message || "").includes("less than the existing version"));
+
+        if (isVersionError && retryDepth < 3) {
+          const probe = indexedDB.open(DB_NAME);
+
+          probe.onsuccess = () => {
+            const currentVersion = Number(probe.result?.version || DB_VERSION) || DB_VERSION;
+            try { probe.result.close(); } catch {}
+            openIndexedDbWithVersion(Math.max(currentVersion, DB_VERSION), resolve, reject, retryDepth + 1);
+          };
+
+          probe.onerror = () => reject(err || probe.error);
+          return;
+        }
+
+        reject(err);
+      };
+    }
+
     function openDB() {
       return new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
-
-        req.onupgradeneeded = () => {
-          const database = req.result;
-
-          STORE_NAMES.forEach((name) => {
-            if (!database.objectStoreNames.contains(name)) {
-              database.createObjectStore(name, { keyPath: "id" });
-            }
-          });
-        };
-
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
+        openIndexedDbWithVersion(DB_VERSION, resolve, reject);
       });
     }
 
@@ -4125,15 +4163,23 @@
       }
     }
 
-    async function saveLocal(store, item, sync = true) {
-      await idbPut(store, item);
+    async function saveLocal(store, item, sync = true, syncMeta = {}) {
+      if (!item || !item.id) return;
+
+      const localItem = {
+        ...item,
+        updatedAt: Math.max(Number(item.updatedAt || item.createdAt || 0), Date.now())
+      };
+
+      await idbPut(store, localItem);
 
       if (sync) {
         await enqueueSync({
           type: "set",
           store,
-          itemId: item.id,
-          data: item
+          itemId: localItem.id,
+          data: localItem,
+          syncMeta: syncMeta || {}
         });
       }
     }
@@ -4791,8 +4837,10 @@
       const touchedStores = new Set();
       const removals = [];
       const latestProductLocal = new Map();
+      const latestProductLocalMeta = new Map();
       const removedProducts = new Set();
       const stockDelta = new Map();
+      const absoluteStockProductIds = new Set();
 
       const sortedQueue = queue.slice().sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
 
@@ -4823,6 +4871,7 @@
 
         if (store === "products") {
           latestProductLocal.set(itemId, data);
+          latestProductLocalMeta.set(itemId, q.syncMeta || q.meta || {});
           touchedStores.add("products");
           continue;
         }
@@ -4866,17 +4915,34 @@
           delete maps.products[productId];
           return;
         }
+
         const remoteProduct = maps.products?.[productId];
+        const meta = latestProductLocalMeta.get(productId) || {};
+        const forceAbsoluteStock = meta.stockMode === "absolute" || meta.absoluteStock === true;
+        if (forceAbsoluteStock) absoluteStockProductIds.add(productId);
+        const hasInvoiceOrPurchaseDelta = stockDelta.has(productId);
+
         if (initialRemoteProductIds.has(productId) && remoteProduct) {
-          const cloudStock = cleanNumber(remoteProduct.stock || 0);
-          maps.products[productId] = normalizeProduct({ ...remoteProduct, ...localProduct, stock: cloudStock, updatedAt: Math.max(oskarCfItemTime(remoteProduct), oskarCfItemTime(localProduct), Date.now()) });
+          const merged = normalizeProduct({
+            ...remoteProduct,
+            ...localProduct,
+            updatedAt: Math.max(oskarCfItemTime(remoteProduct), oskarCfItemTime(localProduct), Date.now())
+          });
+
+          if (hasInvoiceOrPurchaseDelta && !forceAbsoluteStock) {
+            merged.stock = cleanNumber(remoteProduct.stock || 0);
+          } else {
+            merged.stock = cleanNumber(localProduct.stock || 0);
+          }
+
+          maps.products[productId] = normalizeProduct(merged);
         } else {
           maps.products[productId] = normalizeProduct(localProduct);
         }
       });
 
       stockDelta.forEach((delta, productId) => {
-        if (!maps.products || !maps.products[productId] || removedProducts.has(productId)) return;
+        if (!maps.products || !maps.products[productId] || removedProducts.has(productId) || absoluteStockProductIds.has(productId)) return;
         if (initialRemoteProductIds.has(productId)) {
           maps.products[productId] = normalizeProduct({
             ...maps.products[productId],
@@ -6516,7 +6582,7 @@
           ex.category = $("productCategory").value.trim() || ex.category;
           ex.updatedAt = Date.now();
 
-          await saveLocal("products", ex, true);
+          await saveLocal("products", ex, true, { stockMode: "absolute", reason: "manual-product-merge" });
           state.products = state.products.map(p => p.id === ex.id ? ex : p);
 
           closeModal();
@@ -6546,7 +6612,7 @@
           updatedAt: Date.now()
         });
 
-        await saveLocal("products", product, true);
+        await saveLocal("products", product, true, { stockMode: "absolute", reason: "manual-product-form" });
 
         const i = state.products.findIndex(p => p.id === id);
         if (i >= 0) state.products[i] = product;
@@ -14127,9 +14193,10 @@
     .oskar-prime-method-card,
     .oskar-prime-method{grid-template-columns:74px minmax(0,1fr)!important;padding:14px!important}
   }
-  .icon-btn.syncing i,
+  #syncNowBtn.syncing i,
+  .icon-btn.syncing i{animation-duration:1.6s!important}
   .fa-spin,
-  .oskar-prime-safe-spinner{animation-duration:.36s!important}
+  .oskar-prime-safe-spinner{animation-duration:.70s!important}
   .oskar-prime-safe-select.best:before,
   .oskar-prime-select-card.best:before,
   .oskar-prime-plan.best:before,
@@ -14333,7 +14400,8 @@
   }
   function speedSpinners(){
     $$('.fa-spin,.icon-btn.syncing i,.oskar-prime-safe-spinner').forEach(el => {
-      el.style.setProperty('animation-duration', '.36s', 'important');
+      if(el.closest && el.closest('#syncNowBtn')) el.style.setProperty('animation-duration', '1.6s', 'important');
+      else el.style.setProperty('animation-duration', '.70s', 'important');
     });
   }
   function updateTrialText(){
@@ -14432,10 +14500,11 @@
     animation:oskarFastSpin .32s linear infinite;
     margin-inline-start:6px;
   }
-  .icon-btn.syncing i,
+  #syncNowBtn.syncing i,
+  .icon-btn.syncing i{animation-duration:1.6s!important}
   .fa-spin,
   .oskar-prime-safe-spinner,
-  .oskar-mini-loader{animation-duration:.28s!important}
+  .oskar-mini-loader{animation-duration:.70s!important}
   @keyframes oskarFastSpin{to{transform:rotate(360deg)}}
 </style>
 <script id="oskarFastInvoiceExportTrialSyncLockScript20260501B">
@@ -15529,6 +15598,28 @@
 
   if(document.readyState === "loading") document.addEventListener("DOMContentLoaded", bind, {once:true});
   else bind();
+})();
+</script>
+
+
+<!-- OSKAR_SYNC_STOCK_FIX_2026_05_02 -->
+<style id="oskar-sync-stock-fix-2026-05-02-style">
+  #syncNowBtn.syncing i,
+  .icon-btn.syncing i{animation-duration:1.6s!important}
+</style>
+<script id="oskar-sync-stock-fix-2026-05-02-script">
+(function(){
+  "use strict";
+  function slowSyncIcon(){
+    var btn = document.getElementById("syncNowBtn");
+    if(!btn) return;
+    var icon = btn.querySelector("i");
+    if(icon) icon.style.setProperty("animation-duration", "1.6s", "important");
+  }
+  if(document.readyState === "loading") document.addEventListener("DOMContentLoaded", slowSyncIcon, {once:true});
+  else slowSyncIcon();
+  document.addEventListener("click", function(){ setTimeout(slowSyncIcon, 60); }, true);
+  setInterval(slowSyncIcon, 1200);
 })();
 </script>
 
